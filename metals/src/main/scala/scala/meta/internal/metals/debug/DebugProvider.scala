@@ -68,6 +68,7 @@ import com.google.common.net.InetAddresses
 import com.google.gson.JsonElement
 import org.eclipse.lsp4j.MessageParams
 import org.eclipse.lsp4j.MessageType
+import org.eclipse.lsp4j.jsonrpc.messages.Message
 
 /**
  * @param supportsTestSelection test selection hasn't been defined in BSP spec yet.
@@ -99,29 +100,59 @@ class DebugProvider(
 
   private val runningLocal = new ju.concurrent.atomic.AtomicBoolean(false)
 
-  private val debugSessions = new MutableCancelable()
+  // Unified session tracking
+  case class DebugSessionInfo(
+    server: DebugServer,
+    mcpSession: Option[McpDebugSession] = None,
+    runner: Option[DebugRunner] = None,
+    cancelable: Cancelable
+  ) {
+    def cancel(): Unit = {
+      runner.foreach(_.cancel())
+      cancelable.cancel()
+    }
+  }
 
-  private val currentRunner =
-    new ju.concurrent.atomic.AtomicReference[DebugRunner](null)
+  private val debugSessions =
+    new ju.concurrent.ConcurrentHashMap[String, DebugSessionInfo]()
+
+  private val sessionCounter = new ju.concurrent.atomic.AtomicInteger(0)
+
+  private def generateSessionId(sessionName: String): String = {
+    val normalized = sessionName
+      .toLowerCase()
+      .replaceAll("[^a-z0-9]", "-")
+      .replaceAll("-+", "-")
+      .stripPrefix("-")
+      .stripSuffix("-")
+    val counter = sessionCounter.incrementAndGet()
+    s"$normalized-$counter"
+  }
 
   override def info(message: String): Unit = {
-    val runner = currentRunner.get()
-    if (runner != null) runner.stdout(message)
+    // Find active runner from debug sessions
+    import scala.jdk.CollectionConverters._
+    debugSessions.values().asScala
+      .flatMap(_.runner)
+      .foreach(_.stdout(message))
   }
 
   override def error(message: String): Unit = {
-    val runner = currentRunner.get()
-    if (runner != null) runner.error(message)
+    // Find active runner from debug sessions
+    import scala.jdk.CollectionConverters._
+    debugSessions.values().asScala
+      .flatMap(_.runner)
+      .foreach(_.error(message))
   }
 
   override def cancel(): Unit = {
-    val runner = currentRunner.get()
-    if (runner != null) runner.cancel()
-    debugSessions.cancel()
+    // Cancel all active debug sessions
+    import scala.jdk.CollectionConverters._
+    debugSessions.values().asScala.foreach(_.cancel())
   }
 
   def start(
-      parameters: b.DebugSessionParams
+      parameters: b.DebugSessionParams,
   )(implicit ec: ExecutionContext): Future[DebugServer] = {
     val cancelPromise = Promise[Unit]()
     for {
@@ -175,6 +206,14 @@ class DebugProvider(
 
       val awaitClient = () => Future(proxyServer.accept())
 
+      val sessionId = generateSessionId(sessionName)
+      val server = new DebugServer(
+        sessionId,
+        sessionName,
+        uri,
+        () => Future.failed(new RuntimeException("No server connected")),
+      )
+
       DebugRunner
         .open(
           sessionName,
@@ -203,18 +242,24 @@ class DebugProvider(
           cancelPromise,
         )
         .flatMap { runner =>
-          currentRunner.set(runner)
+          // Create session info with runner
+          val sessionInfo = DebugSessionInfo(
+            server = server,
+            mcpSession = None,
+            runner = Some(runner),
+            cancelable = Cancelable.empty
+          )
+          debugSessions.put(sessionId, sessionInfo)
+
           runner.listen.map { code =>
-            currentRunner.set(null)
+            // Clear runner when done
+            Option(debugSessions.get(sessionId)).foreach { info =>
+              debugSessions.put(sessionId, info.copy(runner = None))
+            }
             code
           }
         }
 
-      val server = new DebugServer(
-        sessionName,
-        uri,
-        () => Future.failed(new RuntimeException("No server connected")),
-      )
       Future.successful(server)
     } else {
       Future.failed(
@@ -236,6 +281,7 @@ class DebugProvider(
     val port = proxyServer.getLocalPort
     proxyServer.setSoTimeout(10 * 1000)
     val uri = URI.create(s"tcp://$host:$port")
+    val sessionId = generateSessionId(sessionName)
     val connectedToServer = Promise[Unit]()
 
     val awaitClient =
@@ -286,6 +332,7 @@ class DebugProvider(
             s"${buildServer.name} ${buildServer.version} does not support scala-debug-adapter 2.x"
           )
         }
+
       DebugProxy.open(
         sessionName,
         awaitClient,
@@ -301,12 +348,25 @@ class DebugProvider(
         targets,
       )
     }
-    val server = new DebugServer(sessionName, uri, proxyFactory)
+    val server = new DebugServer(sessionId, sessionName, uri, proxyFactory)
+    val cancelable = new MutableCancelable()
+    cancelable.add(server)
 
-    debugSessions.add(server)
-    server.listen.andThen { case _ =>
-      proxyServer.close()
-      debugSessions.remove(server)
+    val sessionInfo = DebugSessionInfo(
+      server = server,
+      mcpSession = None,
+      runner = None,
+      cancelable = cancelable
+    )
+    debugSessions.put(sessionId, sessionInfo)
+
+    server.listen.andThen {
+      case scala.util.Success(_) =>
+        proxyServer.close()
+        debugSessions.remove(sessionId)
+      case scala.util.Failure(_) =>
+        proxyServer.close()
+        debugSessions.remove(sessionId)
     }
 
     connectedToServer.future.map(_ => server)
@@ -484,7 +544,7 @@ class DebugProvider(
       server <- start(debugParams)
     } yield {
       statusBar.addMessage("Started debug server!")
-      DebugSession(server.sessionName, server.uri.toString)
+      DebugSession(server.id, server.sessionName, server.uri.toString)
     }
   }
 
@@ -673,7 +733,10 @@ class DebugProvider(
           case b.DebugSessionParamsDataKind.SCALA_MAIN_CLASS =>
             json.as[b.ScalaMainClass].map(_.getClassName)
           case b.TestParamsDataKind.SCALA_TEST_SUITES =>
-            json.as[ju.List[String]].map(_.asScala.sorted.mkString(";"))
+            json.as[ju.List[String]].map { testSuites =>
+              val suites = testSuites.asScala.sorted
+              if (suites.size == 1) suites.head else suites.mkString(";")
+            }
           case b.DebugSessionParamsDataKind.SCALA_ATTACH_REMOTE =>
             Success("attach-remote-debug-session")
           case b.TestParamsDataKind.SCALA_TEST_SUITES_SELECTION =>
@@ -684,6 +747,8 @@ class DebugProvider(
                 )
                 .mkString(";")
             }
+          case other =>
+            Failure(new IllegalStateException(s"Unknown dataKind: $other"))
         }
       case data =>
         val dataType = data.getClass.getSimpleName
@@ -789,6 +854,164 @@ class DebugProvider(
   private lazy val BuildServerUnavailableError =
     Future.failed(new IllegalStateException("Build server unavailable"))
 
+  private def startMcpDebugSession(
+      sessionName: String,
+      parameters: b.DebugSessionParams,
+      buildServer: BuildServerConnection,
+      cancelPromise: Promise[Unit],
+      mcpCallback: Message => Unit,
+      initialBreakpoints: List[java.util.Map[String, Object]],
+  )(implicit ec: ExecutionContext): Future[DebugServer] = {
+    val proxyServer = new ServerSocket(0, 50, localAddress)
+    val host = InetAddresses.toUriString(proxyServer.getInetAddress)
+    val port = proxyServer.getLocalPort
+    proxyServer.setSoTimeout(10 * 1000)
+    val uri = URI.create(s"tcp://$host:$port")
+    val sessionId = generateSessionId(sessionName)
+    val connectedToServer = Promise[Unit]()
+
+    // long timeout, since server might take a while to compile the project
+    val connectToServer = () => {
+      val targets = parameters.getTargets().asScala.toSeq
+
+      compilations
+        .compilationFinished(targets, compileInverseDependencies = false)
+        .flatMap { _ =>
+          val conn =
+            startDebugSession(buildServer, parameters, cancelPromise)
+              .map { uri =>
+                val socket = connect(uri)
+                connectedToServer.trySuccess(())
+                socket
+              }
+
+          val startupTimeout =
+            clientConfig.initialConfig.debugServerStartTimeout
+
+          conn
+            .withTimeout(startupTimeout, TimeUnit.SECONDS)
+            .recover { case exception =>
+              connectedToServer.tryFailure(exception)
+              cancelPromise.trySuccess(())
+              throw exception
+            }
+        }
+    }
+
+    val proxyFactory = { () =>
+      val targets = parameters.getTargets.asScala.toSeq
+        .map(_.getUri)
+        .map(new BuildTargetIdentifier(_))
+
+      val debugAdapter =
+        if (buildServer.usesScalaDebugAdapter2x) {
+          MetalsDebugAdapter(
+            buildTargets,
+            targets,
+            supportVirtualDocuments = clientConfig.isVirtualDocumentSupported(),
+          )
+        } else {
+          throw new IllegalArgumentException(
+            s"${buildServer.name} ${buildServer.version} does not support scala-debug-adapter 2.x"
+          )
+        }
+
+      val mcpEndpoint = new McpEndpoint(mcpCallback)
+
+      // Use MCP-only mode for MCP sessions
+      DebugProxy.openMcpOnly(
+        sessionName,
+        connectToServer,
+        debugAdapter,
+        stacktraceAnalyzer,
+        compilers,
+        workspace,
+        clientConfig.disableColorOutput(),
+        workDoneProgress,
+        sourceMapper,
+        compilations,
+        targets,
+        mcpEndpoint,
+      )
+    }
+
+    val server = new DebugServer(sessionId, sessionName, uri, proxyFactory)
+    val cancelable = new MutableCancelable()
+    cancelable.add(server)
+
+    // Create MCP session for tracking
+    val mcpEndpoint = new McpEndpoint(mcpCallback)
+    val mcpSession = new McpDebugSession(sessionId, mcpEndpoint, initialBreakpoints)
+
+    val sessionInfo = DebugSessionInfo(
+      server = server,
+      mcpSession = Some(mcpSession),
+      runner = None,
+      cancelable = cancelable
+    )
+    debugSessions.put(sessionId, sessionInfo)
+
+    server.listen.andThen {
+      case scala.util.Success(_) =>
+        proxyServer.close()
+        debugSessions.remove(sessionId)
+      case scala.util.Failure(_) =>
+        proxyServer.close()
+        debugSessions.remove(sessionId)
+    }
+
+    connectedToServer.future.map(_ => server)
+  }
+
+  /**
+   * Start a debug session with MCP callback-based communication.
+   */
+  def startForMcp(
+      parameters: b.DebugSessionParams,
+      mcpCallback: Message => Unit,
+      initialBreakpoints: List[java.util.Map[String, Object]] = Nil,
+  )(implicit ec: ExecutionContext): Future[DebugSession] = {
+    val cancelPromise = Promise[Unit]()
+    for {
+      sessionName <- Future.fromTry(parseSessionName(parameters))
+      jvmOptionsTranslatedParams = translateJvmParams(parameters)
+      buildServer <- buildServerConnect(parameters)
+        .fold[Future[BuildServerConnection]](BuildServerUnavailableError)(
+          Future.successful
+        )
+      debugServer <- startMcpDebugSession(
+        sessionName,
+        jvmOptionsTranslatedParams,
+        buildServer,
+        cancelPromise,
+        mcpCallback,
+        initialBreakpoints,
+      )
+    } yield {
+      statusBar.addMessage("Started debug server!")
+      DebugSession(debugServer.id, debugServer.sessionName, debugServer.uri.toString)
+    }
+  }
+
+  /**
+   * Get an MCP adapter for a debug session (if connected).
+   */
+  def mcpSession(sessionId: String): Option[McpDebugSession] = {
+    Option(debugSessions.get(sessionId)).flatMap(_.mcpSession)
+  }
+
+  /**
+   * Get all active debug sessions.
+   */
+  def allDebugSessions(): List[(DebugSession, Boolean)] = {
+    import scala.jdk.CollectionConverters._
+    debugSessions.asScala.map { case (_, sessionInfo) =>
+      val session =
+        DebugSession(sessionInfo.server.id, sessionInfo.server.sessionName, sessionInfo.server.uri.toString)
+      val hasMcp = sessionInfo.mcpSession.isDefined
+      (session, hasMcp)
+    }.toList
+  }
 }
 
 object DebugProvider {

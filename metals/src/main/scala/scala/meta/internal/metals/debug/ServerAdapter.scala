@@ -30,6 +30,13 @@ final class ServerAdapter(server: RemoteEndpoint)(implicit ec: ExecutionContext)
     server.consume(message)
   }
 
+  def sendRequest[M <: ResponseMessage](request: RequestMessage): Future[M] = {
+    val promise = Promise[ResponseMessage]()
+    server.consume(request)
+    partitions += (request.getId -> promise.success)
+    promise.future.map(_.asInstanceOf[M])
+  }
+
   def sendPartitioned[Response](
       parts: Iterable[RequestMessage]
   ): Future[Iterable[ResponseMessage]] = {

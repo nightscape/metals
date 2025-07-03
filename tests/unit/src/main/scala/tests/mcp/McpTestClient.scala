@@ -17,7 +17,7 @@ import io.modelcontextprotocol.spec.McpSchema.TextContent
 class TestMcpClient(url: String, val port: Int)(implicit ec: ExecutionContext) {
   private val objectMapper = new ObjectMapper()
   private val transport = new HttpClientSseClientTransport(url)
-  private val client = McpClient.async(transport).build()
+  private val client = McpClient.async(transport).requestTimeout(java.time.Duration.ofSeconds(240)).build()
 
   private def callTool(
       toolName: String,
@@ -71,5 +71,182 @@ class TestMcpClient(url: String, val port: Int)(implicit ec: ExecutionContext) {
   def listModules(): Future[String] = {
     val params = objectMapper.createObjectNode()
     callTool("list-modules", params).map(_.mkString)
+  }
+
+  def debugMain(
+      mainClass: String,
+      module: Option[String] = None,
+      args: List[String] = Nil,
+      env: Map[String, String] = Map.empty,
+      initialBreakpoints: Option[List[Map[String, Any]]] = None,
+  ): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("mainClass", mainClass)
+    module.foreach(m => params.put("module", m))
+    if (args.nonEmpty) {
+      val argsArray = objectMapper.createArrayNode()
+      args.foreach(argsArray.add)
+      params.set("args", argsArray)
+    }
+    if (env.nonEmpty) {
+      val envNode = objectMapper.createObjectNode()
+      env.foreach { case (k, v) => envNode.put(k, v) }
+      params.set("env", envNode)
+    }
+    initialBreakpoints.foreach { b =>
+      val bArray = objectMapper.createArrayNode()
+      b.foreach { breakpoint =>
+        val bNode = objectMapper.createObjectNode()
+        breakpoint.foreach {
+          case (key, value: String) => bNode.put(key, value)
+          case (key, value: Int) => bNode.put(key, value)
+          case (key, value: Any) => bNode.put(key, value.toString)
+        }
+        bArray.add(bNode)
+      }
+      params.set("initialBreakpoints", bArray)
+      ()
+    }
+    callTool("debug-main", params).map(_.mkString)
+  }
+
+  def debugTest(
+      testClass: String,
+      module: Option[String] = None,
+      testMethod: Option[String] = None,
+      initialBreakpoints: Option[List[Map[String, Any]]] = None,
+  ): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("testClass", testClass)
+    module.foreach(m => params.put("module", m))
+    testMethod.foreach(m => params.put("testMethod", m))
+    initialBreakpoints.foreach { b =>
+      val bArray = objectMapper.createArrayNode()
+      b.foreach { breakpoint =>
+        val bNode = objectMapper.createObjectNode()
+        breakpoint.foreach {
+          case (key, value: String) => bNode.put(key, value)
+          case (key, value: Int) => bNode.put(key, value)
+          case (key, value: Any) => bNode.put(key, value.toString)
+        }
+        bArray.add(bNode)
+      }
+      params.set("initialBreakpoints", bArray)
+      ()
+    }
+    callTool("debug-test", params).map(_.mkString)
+  }
+
+  def debugAttach(
+      port: Int,
+      hostName: Option[String] = None,
+      module: Option[String] = None,
+      initialBreakpoints: Option[List[Map[String, Any]]] = None,
+  ): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("port", port)
+    hostName.foreach(h => params.put("hostName", h))
+    module.foreach(m => params.put("module", m))
+    initialBreakpoints.foreach { b =>
+      val bArray = objectMapper.createArrayNode()
+      b.foreach { breakpoint =>
+        val bNode = objectMapper.createObjectNode()
+        breakpoint.foreach {
+          case (key, value: String) => bNode.put(key, value)
+          case (key, value: Int) => bNode.put(key, value)
+          case (key, value: Any) => bNode.put(key, value.toString)
+        }
+        bArray.add(bNode)
+      }
+      params.set("initialBreakpoints", bArray)
+      ()
+    }
+    callTool("debug-attach", params).map(_.mkString)
+  }
+
+  def debugSessions(): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    callTool("debug-sessions", params).map(_.mkString)
+  }
+
+  def debugPause(sessionId: String, threadId: Option[Int] = None): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("sessionId", sessionId)
+    threadId.foreach(t => params.put("threadId", t))
+    callTool("debug-pause", params).map(_.mkString)
+  }
+
+  def debugContinue(sessionId: String, threadId: Option[Int] = None): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("sessionId", sessionId)
+    threadId.foreach(t => params.put("threadId", t))
+    callTool("debug-continue", params).map(_.mkString)
+  }
+
+  def debugStep(sessionId: String, threadId: Int, stepType: String): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("sessionId", sessionId)
+    params.put("threadId", threadId)
+    params.put("stepType", stepType)
+    callTool("debug-step", params).map(_.mkString)
+  }
+
+  def debugEvaluate(sessionId: String, expression: String, frameId: Int): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("sessionId", sessionId)
+    params.put("expression", expression)
+    params.put("frameId", frameId)
+    callTool("debug-evaluate", params).map(_.mkString)
+  }
+
+  def debugVariables(sessionId: String, threadId: Int, frameId: Option[Int] = None): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("sessionId", sessionId)
+    params.put("threadId", threadId)
+    frameId.foreach(f => params.put("frameId", f))
+    callTool("debug-variables", params).map(_.mkString)
+  }
+
+  def debugBreakpoints(sessionId: String, source: String, breakpoints: List[Map[String, Any]]): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("sessionId", sessionId)
+    params.put("source", source)
+    val bArray = objectMapper.createArrayNode()
+    breakpoints.foreach { breakpoint =>
+      val bNode = objectMapper.createObjectNode()
+      breakpoint.foreach {
+        case (key, value: String) => bNode.put(key, value)
+        case (key, value: Int) => bNode.put(key, value)
+        case (key, value: Any) => bNode.put(key, value.toString)
+      }
+      bArray.add(bNode)
+    }
+    params.set("breakpoints", bArray)
+    callTool("debug-breakpoints", params).map(_.mkString)
+  }
+
+  def debugTerminate(sessionId: String): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("sessionId", sessionId)
+    callTool("debug-terminate", params).map(_.mkString)
+  }
+
+  def debugThreads(sessionId: String): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("sessionId", sessionId)
+    callTool("debug-threads", params).map(_.mkString)
+  }
+
+  def debugStackTrace(sessionId: String, threadId: Int): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("sessionId", sessionId)
+    params.put("threadId", threadId)
+    callTool("debug-stack-trace", params).map(_.mkString)
+  }
+
+  def debugConnect(sessionId: String): Future[String] = {
+    val params = objectMapper.createObjectNode()
+    params.put("sessionId", sessionId)
+    callTool("debug-connect", params).map(_.mkString)
   }
 }
